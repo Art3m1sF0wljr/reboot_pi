@@ -23,42 +23,71 @@ class StreamMonitor:
             raise ValueError("Missing required environment variables")
     
     def check_live_stream(self):
-        """Check if there's a live stream using yt-dlp"""
+        """Check if there's a currently live stream using yt-dlp"""
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'extract_flat': True,
+            'extract_flat': False,
             'force_json': True,
+            'playlistend': 10,
         }
         
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Extract channel livestreams
                 info = ydl.extract_info(self.channel_url, download=False)
                 
-                # Check if any entry is a live stream
-                live_streams = [
-                    entry for entry in info.get('entries', [])
-                    if entry.get('is_live') or 'live' in entry.get('title', '').lower()
-                ]
+                current_live_streams = []
+                for entry in info.get('entries', []):
+                    is_currently_live = (
+                        entry.get('live_status') == 'is_live' or
+                        (entry.get('is_live') and not entry.get('was_live')) or
+                        entry.get('live_status') == 'live'
+                    )
+                    
+                    if is_currently_live:
+                        duration = entry.get('duration', 0)
+                        if duration is None or duration > 3600:
+                            current_live_streams.append(entry)
                 
-                is_live = len(live_streams) > 0
-                
-                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                if is_live:
-                    print(f"[{current_time}] ✅ Live stream detected")
-                    self.consecutive_failures = 0
-                else:
-                    print(f"[{current_time}] ❌ No live stream detected")
-                    self.consecutive_failures += 1
-                
-                return is_live
+                is_live = len(current_live_streams) > 0
+                return is_live, current_live_streams
                 
         except Exception as e:
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[{current_time}] ⚠️ Error checking stream: {e}")
-            self.consecutive_failures += 1
-            return False
+            return False, []
+    
+    def check_live_stream_alternative(self):
+        """Alternative method using YouTube's live search filter"""
+        try:
+            if '/videos' in self.channel_url or '/streams' in self.channel_url:
+                live_url = self.channel_url.replace('/videos', '/streams').replace('/featured', '/streams')
+            else:
+                live_url = self.channel_url.rstrip('/') + '/streams'
+            
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': True,
+                'force_json': True,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(live_url, download=False)
+                
+                current_live = []
+                for entry in info.get('entries', []):
+                    if (entry.get('live_status') == 'is_live' or 
+                        (entry.get('is_live') and 'live' in entry.get('title', '').lower())):
+                        current_live.append(entry)
+                
+                is_live = len(current_live) > 0
+                return is_live, current_live
+                
+        except Exception as e:
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[{current_time}] ⚠️ Error checking stream (alternative): {e}")
+            return False, []
     
     def reboot_raspberry_pi(self):
         """Reboot the Raspberry Pi using sshpass and subprocess"""
@@ -66,7 +95,6 @@ class StreamMonitor:
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[{current_time}] 🔄 Attempting to reboot Raspberry Pi...")
             
-            # Use sshpass to handle password authentication
             command = [
                 'sshpass', '-p', self.ssh_password,
                 'ssh', f'{self.ssh_username}@{self.ssh_host}',
@@ -90,16 +118,31 @@ class StreamMonitor:
             return False
     
     def monitor_task(self):
-        """Main monitoring task"""
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔍 Checking for live streams...")
+        """Main monitoring task - only increments failure counter once per check"""
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{current_time}] 🔍 Checking for live streams...")
         
-        is_live = self.check_live_stream()
+        # Try both methods, but only count one failure if both fail
+        is_live1, streams1 = self.check_live_stream()
+        is_live2, streams2 = self.check_live_stream_alternative()
+        
+        # Consider it a live stream if either method detects one
+        is_live = is_live1 or is_live2
+        
+        if is_live:
+            stream_title = streams1[0].get('title', 'Unknown') if streams1 else streams2[0].get('title', 'Unknown') if streams2 else 'Unknown'
+            print(f"[{current_time}] ✅ Live stream detected: {stream_title}")
+            self.consecutive_failures = 0
+        else:
+            print(f"[{current_time}] ❌ No live stream detected")
+            self.consecutive_failures += 1
+            print(f"[{current_time}] 📊 Consecutive failures: {self.consecutive_failures}/{self.max_failures}")
         
         # Check if we need to reboot
         if self.consecutive_failures >= self.max_failures:
             print(f"🚨 {self.consecutive_failures} consecutive failures detected - rebooting Raspberry Pi")
             self.reboot_raspberry_pi()
-            print(f"I WOULD HAVE REBOOTED NOW, CHECK IF OK")
+            print("I WOULD HAVE REBOOTED NOW, CHECK IF OK")
             # Reset counter after reboot attempt
             self.consecutive_failures = 0
     
